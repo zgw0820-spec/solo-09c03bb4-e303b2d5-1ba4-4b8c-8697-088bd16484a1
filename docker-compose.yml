@@ -1,0 +1,64 @@
+services:
+  authoritative:
+    build: .
+    command: python -m app.authoritative
+    environment:
+      DB_PATH: /data/dns.db
+      LISTEN_ADDR: 0.0.0.0
+      LISTEN_PORT: "53"
+      DOMAINS: "app1.internal,app2.internal"
+    volumes:
+      - dns-data:/data
+    networks:
+      dnsnet:
+        aliases:
+          - authoritative
+    restart: unless-stopped
+
+  resolver:
+    build: .
+    command: python -m app.resolver
+    depends_on:
+      - authoritative
+    environment:
+      LISTEN_ADDR: 0.0.0.0
+      LISTEN_PORT: "53"
+      STATS_PORT: "8081"
+      UPSTREAM_HOST: authoritative
+      UPSTREAM_PORT: "53"
+      UPSTREAM_TIMEOUT: "3.0"
+    ports:
+      # 客户端真实 UDP 查询入口（网页后端也走这里）
+      - "5354:53/udp"
+      # 解析器内部状态 / 回源次数查询接口
+      - "8081:8081"
+    networks:
+      - dnsnet
+    # 不挂载任何卷：缓存只在内存，容器重建即清空
+    restart: unless-stopped
+
+  web:
+    build: .
+    command: python -m app.web
+    depends_on:
+      - resolver
+    environment:
+      DB_PATH: /data/dns.db
+      RESOLVER_HOST: resolver
+      RESOLVER_PORT: "53"
+      RESOLVER_STATS: "http://resolver:8081"
+      DOMAINS: "app1.internal,app2.internal"
+    volumes:
+      - dns-data:/data
+    ports:
+      - "8000:8000"
+    networks:
+      - dnsnet
+    restart: unless-stopped
+
+networks:
+  dnsnet:
+    driver: bridge
+
+volumes:
+  dns-data:
