@@ -53,6 +53,7 @@
   <h1>机房 DNS 改址 / 撤销演示台</h1>
   <div class="meta">
     权威→SQLite 实时读取 ｜ 解析器仅内存缓存，重启即清空 ｜
+    正缓存进入 TTL 最后 1/4 时由命中请求触发一次后台预取 ｜
     查询入口：<span id="resolver-endpoint">-</span>
   </div>
 </header>
@@ -93,6 +94,7 @@
       <thead><tr>
         <th>域名</th><th>缓存</th><th>种类</th><th>RCODE</th><th>应答数据</th>
         <th>原始 TTL</th><th>剩余 TTL</th><th>回源次数</th>
+        <th>预取回源</th><th>预取状态</th>
         <th>正在回源</th><th>等待者</th><th>最近错误</th>
       </tr></thead>
       <tbody></tbody>
@@ -191,6 +193,11 @@ function renderStats() {
     else cachePill = pill('无缓存（将回源）', 'muted');
     const kind = s.cache_kind ? pill(s.cache_kind === 'positive' ? '正缓存 A' : '负缓存 NXDOMAIN',
                                      s.cache_kind === 'positive' ? 'ok' : 'warn') : '-';
+    let prefetchPill;
+    if (s.prefetching) prefetchPill = pill('预取中 ' + s.inflight_age_ms + 'ms', 'warn');
+    else if (s.prefetch_due) prefetchPill = pill('已进入预取窗口', 'warn');
+    else if (s.prefetch_attempted) prefetchPill = pill('本份缓存已预取', 'muted');
+    else prefetchPill = '-';
     return `<tr>
       <td><code>${n}</code></td>
       <td>${cachePill}</td>
@@ -200,7 +207,9 @@ function renderStats() {
       <td>${s.ttl_original ?? '-'}</td>
       <td><b>${s.ttl_remaining ?? '-'}</b></td>
       <td><b>${s.upstream_attempts ?? 0}</b></td>
-      <td>${s.inflight ? pill('回源中 ' + s.inflight_age_ms + 'ms', 'warn') : '-'}</td>
+      <td><b>${s.prefetch_attempts ?? 0}</b>${s.prefetch_failures ? ' / 失败 ' + s.prefetch_failures : ''}</td>
+      <td>${prefetchPill}</td>
+      <td>${s.inflight ? pill((s.prefetching ? '预取回源 ' : '回源中 ') + s.inflight_age_ms + 'ms', 'warn') : '-'}</td>
       <td>${s.inflight ? s.inflight_waiters : '-'}</td>
       <td>${s.last_error ? pill(s.last_error, 'err') : '-'}</td>
     </tr>`;
@@ -274,7 +283,8 @@ async function runQuery() {
         <span class="k">应答</span><span>${answers}</span>
         <span class="k">剩余 TTL</span><span><b>${s.ttl_remaining ?? '-'}</b> / 原始 ${s.ttl_original ?? '-'}s</span>
         <span class="k">缓存种类</span><span>${s.cache_kind ?? '-'}（${s.cached ? '命中缓存' : '本次回源'}）</span>
-        <span class="k">该域名回源次数</span><span><b>${s.upstream_attempts ?? '-'}</b></span>
+        <span class="k">该域名回源次数</span><span><b>${s.upstream_attempts ?? '-'}</b>，其中预取 <b>${s.prefetch_attempts ?? 0}</b></span>
+        <span class="k">预取状态</span><span>${s.prefetching ? '正在后台预取' : (s.prefetch_attempted ? '本份缓存已预取过' : '尚未预取')}</span>
       </div>`;
   }
   refresh();

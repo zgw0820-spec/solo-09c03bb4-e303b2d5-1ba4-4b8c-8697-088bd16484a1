@@ -2,7 +2,7 @@
 
 一个面向机房值班场景的最小 DNS 实验平台：在网页上给两个内网域名设置 / 删除 A 记录、
 调整 TTL 与权威回包延迟，然后发起**真实 UDP DNS 查询**，观察客户端何时拿到新答复、
-剩余 TTL 如何递减、解析器向权威回源了几次。
+剩余 TTL 如何递减、解析器向权威回源了几次、缓存到期前是否已经预取。
 
 ## 架构
 
@@ -13,7 +13,7 @@
                SQLite (共享卷 dns-data)        │
                                                │
 客户端/网页后端 ──UDP 53──> resolver (缓存解析器, dnslib)
-                               │  缓存未命中/过期才回源（UDP 53）
+                               │  未命中/过期回源；正缓存最后 1/4 由命中请求触发一次预取
                                ▼
                           authoritative (权威 DNS, dnslib, AA)
                                │
@@ -23,8 +23,8 @@
 - **authoritative**：线程化 UDP 权威服务。A 记录存在则回 AA 应答（TTL 取记录值）；
   不存在则回 `NXDOMAIN` 并在 authority 段带 SOA，SOA 的 `minimum` 即负缓存期限。
 - **resolver**：线程化 UDP 缓存解析器，另带一个 HTTP 状态口（8081）暴露
-  每域名的回源次数、缓存种类、剩余 TTL、单飞状态、最近错误。缓存**只在内存**，
-  容器不挂卷，重启即空。
+  每域名的回源次数、预取回源/失败次数、是否正在预取、缓存种类、剩余 TTL、
+  单飞状态、最近错误。缓存**只在内存**，容器不挂卷，重启即空。
 - **web**：FastAPI + 单文件原生 JS 页面，SQLite 存记录与设置，启动时自动建表播种。
 
 ## 启动（Docker Compose）
@@ -49,8 +49,9 @@ scripts/selftest-local.sh        # 自动起三进程、跑自测、重启验证
 2. 全局**负缓存 TTL**（写入权威 SOA minimum）。
 3. 每域名**权威回包延迟（毫秒）**与**静默丢包开关**（模拟权威不可达）。
 4. 输入**查询等待上限（毫秒）**后发起真实 UDP 查询，展示结果码、应答、
-   答复 DNS ID 是否与查询一致、剩余 TTL、缓存种类、该域名累计回源次数。
-5. 解析器实时状态表，可 2 秒自动刷新。
+   答复 DNS ID 是否与查询一致、剩余 TTL、缓存种类、该域名累计回源次数与其中预取次数。
+5. 解析器实时状态表，可 2 秒自动刷新；含每域名的**预取状态**（预取中 / 已进入预取窗口 /
+   本份缓存已预取）与**预取回源次数**（含失败数）。
 
 ## 关键语义（与需求逐条对应）
 
@@ -58,9 +59,17 @@ scripts/selftest-local.sh        # 自动起三进程、跑自测、重启验证
 | --- | --- |
 | A 按记录 TTL 失效 | `resolver.CacheEntry.expiry = now + 应答最小 TTL`；命中时按剩余秒数重写 RR TTL |
 | NXDOMAIN 按 SOA 负缓存期限失效 | 权威 NXDOMAIN 带 SOA；解析器取 `SOA.minimum` 作为负缓存 TTL |
-| 到期后按权威现况重查 | 缓存仅在 `fresh()` 时命中；过期即重新回源，不预先刷新 |
+| 到期后按权威现况重查 | 缓存仅在 `fresh()` 时命中；过期即重新回源 |
 | 回源失败不沿用过期答复 | 失败路径不写/不读缓存，直接 `SERVFAIL`；过期条目不会被返回 |
 | 回源失败不缓存为 NXDOMAIN | 仅缓存真实 `NOERROR`/`NXDOMAIN`/`NODATA`；超时/异常/SERVFAIL 一律不缓存 |
+| 正缓存最后 1/4 由命中触发预取 | `CacheEntry.needs_prefetch()`：`remaining*4 <= 原 TTL` 的正缓存 |
+| 同一份缓存最多预取一次 | 条目上的 `prefetch_attempted` 标记；已有回源在进行时也不重复触发；预取成功替换缓存后标记随新条目重置 |
+| 命中请求仍立即收到原答复、TTL 照常递减 | 命中分支先构造旧条目答复并直接返回，预取放到后台线程；不把命中者计入等待者 |
+| 预取拿到 A 或 NXDOMAIN 后按正常规则更新缓存 | 预取与按需回源共用 `_run_flight()` / `_store_reply()`，同样是 A 正缓存、NXDOMAIN/NODATA 负缓存 |
+| 旧缓存到期后新请求共用未完成的预取 | 预取也占用 `inflight[key]`；过期未命中者加入同一 Flight 等待，答复按各自 DNS ID 重写 |
+| 预取失败旧缓存照原期限使用 | 失败不删除、不延长已有条目；`prefetch_failures` 单独计数 |
+| 预取失败时等待回源的请求收到 SERVFAIL | 等待者见 `flight.error` 即回 SERVFAIL |
+| 预取失败后未命中请求可重新回源 | 失败不写缓存；`inflight` 清理后下一次未命中重新建 Flight |
 | 同名并发冷查询只回源一次 | `inflight` 字典 + `threading.Event` 单飞；后来者在同一 Flight 上等待 |
 | 单个请求超时不取消其他等待者 | 等待者超时只让自己回 SERVFAIL；leader 的回源 socket 与 Event 不受影响 |
 | 答复对应各自 DNS ID | 缓存模板 `id=0`，发出前用每个客户端自己的查询 ID 重写（自测逐包校验） |
@@ -70,13 +79,15 @@ scripts/selftest-local.sh        # 自动起三进程、跑自测、重启验证
 ## 自测
 
 ```bash
-scripts/selftest.sh           # Docker Compose 环境：33 项端到端断言 + 重启验证
-scripts/selftest-local.sh     # 本地三进程等价跑法（本仓库即以此验证）
+scripts/selftest.sh           # Docker Compose 环境：同一套端到端断言 + 重启验证
+scripts/selftest-local.sh     # 本地三进程等价跑法（本仓库以此验证：66 项断言全通过）
 ```
 
-覆盖 9 组场景：冷查询/缓存命中、正 TTL 到期改址、NXDOMAIN 负缓存、
+覆盖 12 组场景：冷查询/缓存命中、正 TTL 到期改址、NXDOMAIN 负缓存、
 负缓存期内恢复记录、回源失败（SERVFAIL、不缓存、不沿用）、8 路同名单飞、
-等待者超时隔离、慢域名互不阻塞、重启缓存清空。
+等待者超时隔离、慢域名互不阻塞、**预取正常路径（命中触发一次、立即回旧答复、
+旧缓存先到期时新请求共用预取、预取结果替换缓存）**、**预取得到 NXDOMAIN 按负缓存更新**、
+**预取失败（旧缓存照原期限、等待者 SERVFAIL、之后重新回源成功）**、重启缓存清空。
 
 ## 目录
 
@@ -85,7 +96,7 @@ app/
   config.py          环境变量集中配置
   db.py              SQLite 建表 / 记录与设置读写（WAL）
   authoritative.py   权威 DNS（dnslib，线程化 UDP）
-  resolver.py        缓存解析器 + 单飞 + HTTP 状态口
+  resolver.py        缓存解析器 + 单飞 + 后台预取 + HTTP 状态口
   web.py             FastAPI 接口（含真实 UDP 查询代理）
   static/index.html  操作网页
 scripts/
@@ -99,5 +110,9 @@ Dockerfile
 ## 说明与边界
 
 - 实验聚焦 A 记录：解析器对非 A 查询直接转发、不缓存。
+- 预取只对**正缓存**生效（负缓存按原负 TTL 自然过期后回源）；预取窗口固定为原 TTL 的
+  最后 1/4，没有做抖动/随机化。
+- 预取的回源超时沿用全局 `UPSTREAM_TIMEOUT`；没有单独的预取超时或退避策略，
+  失败后同一份缓存不会重试，直到条目被新回源结果替换。
 - 解析器只服务本实验域名的观察需求，没有做递归/转发链路、DNSSEC、TCP/53。
 - “静默丢包”是测试夹具，用于确定性复现权威不可达；生产环境请勿保留。

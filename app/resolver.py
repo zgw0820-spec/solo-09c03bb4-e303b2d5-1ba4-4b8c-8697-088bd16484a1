@@ -9,10 +9,18 @@
 3. 同名并发冷查询只回源一次（singleflight）：后来者在 Event 上等待同一次回源。
    某个等待者自己等超时只影响它自己（回 SERVFAIL），不会取消正在回源的 leader，
    也不影响其他等待者；每个客户端拿到的答复都换成自己查询的 DNS ID。
-4. 线程化 UDP + 按名单飞：慢域名的回源不会阻塞另一个域名的查询。
-5. 缓存只在进程内存中，不写磁盘；进程/容器重启后缓存为空。
-6. 附带 HTTP 状态接口（STATS_PORT）：每个名字的回源次数、缓存种类、剩余 TTL、
-   最近错误、是否正在回源等，供网页展示。
+4. 正缓存进入原 TTL 的最后四分之一后，由命中请求触发一次后台预取：
+   - 同一份缓存最多触发一次预取；
+   - 命中请求立即返回旧的缓存答复，TTL 仍按旧条目递减；
+   - 预取成功（A / NXDOMAIN / NODATA）按正常回源规则替换缓存；
+   - 预取失败时旧条目保留到原期限，不延长、不提前淘汰；
+   - 旧条目到期而预取仍未完成时，新的未命中请求加入这次预取（singleflight），
+     各自拿到自己 DNS ID 的答复；预取失败则这些等待者收到 SERVFAIL，
+     之后的未命中请求可以重新回源。
+5. 线程化 UDP + 按名单飞：慢域名的回源不会阻塞另一个域名的查询。
+6. 缓存只在进程内存中，不写磁盘；进程/容器重启后缓存为空。
+7. 附带 HTTP 状态接口（STATS_PORT）：每个名字的回源次数、预取回源次数/失败数、
+   缓存种类、剩余 TTL、最近错误、是否正在回源/预取等，供网页展示。
 """
 import json
 import random
@@ -29,9 +37,10 @@ from . import config
 
 
 class Flight:
-    """一次正在进行的回源（同名并发查询共享）。"""
+    """一次正在进行的回源（同名并发查询共享；可能是按需回源或后台预取）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, kind: str = "on-demand") -> None:
+        self.kind = kind  # "on-demand" | "prefetch"
         self.event = threading.Event()
         self.error: Optional[str] = None
         self.waiters = 0
@@ -49,12 +58,25 @@ class CacheEntry:
         self.stored_monotonic = time.monotonic()
         self.stored_wall = time.time()
         self.expiry = self.stored_monotonic + ttl
+        # 这一份缓存条目是否已触发过预取：同一份缓存最多预取一次
+        self.prefetch_attempted = False
 
     def remaining(self) -> int:
         return max(0, int(self.expiry - time.monotonic()))
 
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.expiry - time.monotonic())
+
     def fresh(self) -> bool:
         return time.monotonic() < self.expiry
+
+    def needs_prefetch(self) -> bool:
+        """仅正缓存、且进入原 TTL 最后四分之一、且尚未预取过。"""
+        return (
+            self.kind == "positive"
+            and not self.prefetch_attempted
+            and self.remaining_seconds() * 4 <= self.ttl
+        )
 
 
 class CachingResolver:
@@ -62,8 +84,11 @@ class CachingResolver:
         self.lock = threading.Lock()
         self.cache: dict[str, CacheEntry] = {}
         self.inflight: dict[str, Flight] = {}
-        # 每个名字实际发出的上游 UDP 查询次数（即“回源次数”）
+        # 每个名字实际发出的上游 UDP 查询次数（即“回源次数”，含预取回源）
         self.attempts: dict[str, int] = {}
+        # 其中由“缓存到期前预取”触发的回源次数 / 预取失败次数
+        self.prefetch_attempts: dict[str, int] = {}
+        self.prefetch_failures: dict[str, int] = {}
         self.total_queries = 0
         self.upstream_failures = 0
         self.last_error: dict[str, str] = {}
@@ -153,21 +178,42 @@ class CachingResolver:
         # 最多两轮：等待者超时后可再参与一轮（成为新 leader 或加入新 flight），
         # 保证“自己超时不影响别人、也不取消正在进行的回源”。
         for _ in range(2):
+            start_prefetch = False
+            cached_reply: Optional[DNSRecord] = None
             with self.lock:
                 entry = self.cache.get(key)
                 if entry is not None and entry.fresh():
-                    return self._from_entry(query, entry)
-                flight = self.inflight.get(key)
-                if flight is None:
-                    flight = Flight()
-                    self.inflight[key] = flight
-                    leader = True
+                    cached_reply = self._from_entry(query, entry)
+                    # 正缓存进入最后四分之一：标记这一份缓存已预取，并起后台预取。
+                    # 同一份缓存只触发一次；已有回源在进行时不重复触发。
+                    if entry.needs_prefetch() and key not in self.inflight:
+                        entry.prefetch_attempted = True
+                        flight = Flight("prefetch")
+                        self.inflight[key] = flight
+                        start_prefetch = True
                 else:
-                    flight.waiters += 1
-                    leader = False
+                    flight = self.inflight.get(key)
+                    if flight is None:
+                        flight = Flight("on-demand")
+                        self.inflight[key] = flight
+                        leader = True
+                    else:
+                        flight.waiters += 1
+                        leader = False
+
+            if cached_reply is not None:
+                if start_prefetch:
+                    # 命中请求立即返回旧答复；预取在后台自己回源、自己收尾
+                    threading.Thread(
+                        target=self._run_flight,
+                        args=(None, key, qname, qtype, flight),
+                        daemon=True,
+                        name=f"prefetch-{key}",
+                    ).start()
+                return cached_reply
 
             if leader:
-                return self._run_leader(query, key, qname, qtype, flight)
+                return self._run_flight(query, key, qname, qtype, flight)
 
             # 等待者：只等这一次回源；超时仅自己回 SERVFAIL，flight 仍由 leader 收尾
             signaled = flight.event.wait(timeout=config.UPSTREAM_TIMEOUT + 2.0)
@@ -175,18 +221,35 @@ class CachingResolver:
                 entry = self.cache.get(key)
                 if entry is not None and entry.fresh():
                     return self._from_entry(query, entry)
-                if signaled and flight.error is None and key not in self.inflight:
-                    # leader 正常结束却没有可缓存内容：按失败处理
-                    return self._servfail(query)
                 if flight.error is not None:
+                    # 预取/回源失败：等待者收到 SERVFAIL；旧条目（若仍有）不被沿用，
+                    # 之后的未命中请求会重新发起回源。
+                    return self._servfail(query)
+                if signaled:
+                    # leader 正常结束却没有可缓存内容：按失败处理
                     return self._servfail(query)
                 # 否则本轮等待超时，进入下一轮（不会取消任何其他等待者）
         return self._servfail(query)
 
-    def _run_leader(self, query: DNSRecord, key: str, qname: str, qtype: str, flight: Flight) -> DNSRecord:
+    def _run_flight(
+        self,
+        query: Optional[DNSRecord],
+        key: str,
+        qname: str,
+        qtype: str,
+        flight: Flight,
+    ) -> Optional[DNSRecord]:
+        """执行一次回源（按需或预取）。
+
+        query 为 None 表示后台预取：没有客户端在等这次调用的直接返回，
+        预取结果只写缓存；失败时保留旧缓存（不删、不延长）。
+        """
+        is_prefetch = flight.kind == "prefetch"
         try:
             with self.lock:
                 self.attempts[key] = self.attempts.get(key, 0) + 1
+                if is_prefetch:
+                    self.prefetch_attempts[key] = self.prefetch_attempts.get(key, 0) + 1
             resp = self._fetch_upstream(qname, qtype)
             try:
                 entry = self._store_reply(key, qname, resp)
@@ -194,19 +257,25 @@ class CachingResolver:
                 flight.error = str(exc)
                 with self.lock:
                     self.last_error[key] = str(exc)
-                return self._servfail(query)
-            return self._from_entry(query, entry)
+                    if is_prefetch:
+                        self.prefetch_failures[key] = self.prefetch_failures.get(key, 0) + 1
+                return self._servfail(query) if query is not None else None
+            return self._from_entry(query, entry) if query is not None else None
         except Exception as exc:  # 超时、ICMP 不可达、解析错误等
-            # 关键：失败不写缓存 -> 不会沿用过期答复，也不会缓存成 NXDOMAIN
+            # 关键：失败不写缓存 -> 不会沿用过期答复，也不会缓存成 NXDOMAIN；
+            # 预取失败时旧缓存条目原样保留到原期限。
             flight.error = repr(exc)
             with self.lock:
                 self.upstream_failures += 1
                 self.last_error[key] = repr(exc)
-            return self._servfail(query)
+                if is_prefetch:
+                    self.prefetch_failures[key] = self.prefetch_failures.get(key, 0) + 1
+            return self._servfail(query) if query is not None else None
         finally:
             with self.lock:
-                self.inflight.pop(key, None)
-                flight.event.set()
+                if self.inflight.get(key) is flight:
+                    self.inflight.pop(key, None)
+            flight.event.set()
 
     def _forward_uncached(self, query: DNSRecord, qname: str, qtype: str) -> DNSRecord:
         try:
@@ -239,16 +308,22 @@ class CachingResolver:
                 per_name[n] = {
                     "name": n,
                     "upstream_attempts": self.attempts.get(n, 0),
+                    "prefetch_attempts": self.prefetch_attempts.get(n, 0),
+                    "prefetch_failures": self.prefetch_failures.get(n, 0),
                     "inflight": flight is not None,
+                    "inflight_kind": flight.kind if flight else None,
+                    "prefetching": flight is not None and flight.kind == "prefetch",
                     "inflight_waiters": flight.waiters if flight else 0,
                     "inflight_age_ms": int((time.time() - flight.started_at) * 1000) if flight else 0,
                     "cached": entry is not None and entry.fresh(),
                     "expired": entry is not None and not entry.fresh(),
+                    "prefetch_attempted": entry.prefetch_attempted if entry else False,
                     "cache_kind": entry.kind if entry else None,
                     "rcode": entry.rcode if entry else None,
                     "rdata": entry.rdata if entry else [],
                     "ttl_original": entry.ttl if entry else None,
                     "ttl_remaining": entry.remaining() if entry else None,
+                    "prefetch_due": entry.needs_prefetch() if entry else False,
                     "cached_at": entry.stored_wall if entry else None,
                     "last_error": self.last_error.get(n),
                 }
@@ -257,6 +332,7 @@ class CachingResolver:
                 "upstream_failures": self.upstream_failures,
                 "upstream": f"{config.UPSTREAM_HOST}:{config.UPSTREAM_PORT}",
                 "upstream_timeout_s": config.UPSTREAM_TIMEOUT,
+                "prefetch_window": "last quarter of positive TTL",
                 "names": per_name,
             }
 

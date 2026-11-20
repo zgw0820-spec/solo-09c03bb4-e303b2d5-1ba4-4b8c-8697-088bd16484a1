@@ -12,7 +12,10 @@
 6. 同名并发冷查询只回源一次（singleflight），且各自 DNS ID 正确
 7. 单个等待者超时不取消回源、不影响其他等待者
 8. 慢域名不阻塞另一域名
-9. 解析器重启后缓存为空（由 scripts/selftest.sh 控制重启并调用 --restart-check）
+9. 预取正常路径：命中触发一次、立即回旧答复、旧缓存先到期则等待者共用预取
+10. 预取拿到 NXDOMAIN：按负缓存规则替换
+11. 预取失败路径：旧缓存照原期限、等待者 SERVFAIL、之后未命中可重新回源
+12. 解析器重启后缓存为空（由 scripts/selftest.sh 控制重启并调用 --restart-check）
 """
 import json
 import os
@@ -113,8 +116,8 @@ def answers_of(reply):
 
 
 def restart_check():
-    """阶段 9：重启后的解析器必须没有任何旧缓存。"""
-    print("\n== 9. 解析器重启后不得沿用旧缓存 ==")
+    """阶段 12：重启后的解析器必须没有任何旧缓存。"""
+    print("\n== 12. 解析器重启后不得沿用旧缓存 ==")
     snap = stats("")  # name='' 时返回全量
     with urllib.request.urlopen(
         f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
@@ -297,7 +300,182 @@ def main():
           detail=f"elapsed={elapsed:.2f}s")
     set_delay(d2, 0)
 
-    print("\n== 9 预备：制造缓存供重启验证 ==")
+    print("\n== 9. 预取正常路径：命中触发一次，旧缓存先到期则等待者共用预取 ==")
+    # 预取窗口 = 原 TTL 的最后 1/4。令窗口(≈TTL/4) < 权威延迟 < 回源超时，
+    # 就能确定性地得到“旧缓存先到期、预取仍在回源”的真实窗口。
+    with urllib.request.urlopen(
+        f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
+        f"{os.environ.get('RESOLVER_STATS_PORT', '8081')}/stats", timeout=5
+    ) as resp:
+        upstream_timeout = float(json.loads(resp.read().decode())["upstream_timeout_s"])
+    delay_ms = int(upstream_timeout * 1000 * 0.6)
+    # 预取窗口 = TTL/4；令窗口明显小于权威延迟（TTL ≈ 2*延迟），
+    # 就能确定性地得到“旧缓存先于预取回包到期”的窗口。
+    PREFETCH_TTL = max(4, int(2 * delay_ms / 1000))
+    print(f"   （upstream timeout={upstream_timeout}s -> 延迟={delay_ms}ms, TTL={PREFETCH_TTL}s）")
+    set_delay(d2, delay_ms)
+    set_record(d2, "10.0.0.20", PREFETCH_TTL)
+    wait_until(POS_TTL + 3, "d2 旧缓存到期", lambda: not stats(d2).get("cached"))
+    cold, cold_id = dns_query(d2, 6.0)
+    check("预取场景冷查询拿到 A", cold is not None and answers_of(cold) == ["10.0.0.20"],
+          detail=str(answers_of(cold) if cold else None))
+    base_attempts = stats(d2).get("upstream_attempts")
+    base_prefetch = stats(d2).get("prefetch_attempts", 0)
+
+    wait_until(PREFETCH_TTL + 3, "进入预取窗口",
+               lambda: stats(d2) if stats(d2).get("cached") and stats(d2).get("prefetch_due") else None)
+    t_hit = time.time()
+    hit, hit_id = dns_query(d2, 6.0)  # 命中请求：应立即拿到旧答复，同时触发后台预取
+    hit_elapsed = time.time() - t_hit
+    check("预取触发查询立即收到旧答复（未被 2s 权威延迟拖住）",
+          hit is not None and hit_elapsed < 0.5, detail=f"elapsed={hit_elapsed:.2f}s")
+    check("预取触发查询的 DNS ID 正确", hit is not None and int(hit.header.id) == hit_id)
+    check("预取触发查询仍是原 A 答复且 TTL 未重置",
+          hit is not None and answers_of(hit) == ["10.0.0.20"]
+          and all(int(rr.ttl) <= 1 for rr in hit.rr if rr.rtype == QTYPE.A),
+          detail=str([(str(rr.rdata), int(rr.ttl)) for rr in hit.rr]))
+    s = wait_until(3, "预取回源可见", lambda: stats(d2) if stats(d2).get("prefetching") else None)
+    check("同一份缓存只触发一次预取", s.get("prefetch_attempts") == base_prefetch + 1
+          and s.get("upstream_attempts") == base_attempts + 1, detail=str(s))
+    check("预取期间命中请求不计入等待者", s.get("inflight_waiters") == 0, detail=str(s))
+
+    hit2, hit2_id = dns_query(d2, 6.0)  # 预取窗口内再次命中：不得再触发一次预取
+    attempts_now = stats(d2).get("upstream_attempts")
+    check("同份缓存第二次命中不再触发预取", attempts_now == base_attempts + 1,
+          detail=str(stats(d2)))
+    check("第二次命中仍立即回旧答复且 ID 正确",
+          hit2 is not None and int(hit2.header.id) == hit2_id and answers_of(hit2) == ["10.0.0.20"],
+          detail=str(answers_of(hit2) if hit2 else None))
+
+    # 等旧条目先于预取到期：此时缓存为空、预取仍在回源
+    wait_until(3, "旧缓存先到期且预取未完成",
+               lambda: stats(d2) if (not stats(d2).get("cached") and stats(d2).get("prefetching")) else None)
+    t_join = time.time()
+    joined, joined_id = dns_query(d2, 6.0)  # 新请求加入尚未完成的预取
+    joined_elapsed = time.time() - t_join
+    check("旧缓存到期后的新请求共用预取、拿到 NOERROR",
+          joined is not None and joined.header.rcode == RCODE.NOERROR
+          and answers_of(joined) == ["10.0.0.20"], detail=str(joined.header if joined else None))
+    check("共用预取的答复带自己的 DNS ID", joined is not None and int(joined.header.id) == joined_id)
+    check("共用预取不会额外回源", stats(d2).get("upstream_attempts") == base_attempts + 1,
+          detail=str(stats(d2)))
+    check("共用预取需等待已有预取回包（没有另起一次完整回源）",
+          joined_elapsed < delay_ms / 1000.0,
+          detail=f"elapsed={joined_elapsed:.2f}s delay={delay_ms}ms")
+    s = wait_until(3, "预取写入新缓存",
+                   lambda: stats(d2) if stats(d2).get("cached") and stats(d2).get("ttl_remaining", 0) >= PREFETCH_TTL - 1 else None)
+    check("预取成功后缓存被新条目替换（TTL 回到接近原值）",
+          s.get("cache_kind") == "positive" and 1 < s.get("ttl_remaining", 0) <= PREFETCH_TTL,
+          detail=str(s))
+    check("新条目可以再次触发预取（预取标记随缓存替换重置）",
+          s.get("prefetch_attempted") is False, detail=str(s))
+    after, _ = dns_query(d2, 6.0)
+    check("预取后的命中返回新缓存且不再回源",
+          after is not None and answers_of(after) == ["10.0.0.20"]
+          and stats(d2).get("upstream_attempts") == base_attempts + 1,
+          detail=str(stats(d2)))
+
+    print("\n== 10. 预取拿到 NXDOMAIN 也按正常回源规则更新缓存 ==")
+    set_delay(d2, 0)
+    set_record(d2, "10.0.0.20", PREFETCH_TTL)
+    wait_until(PREFETCH_TTL + 3, "d2 旧缓存到期", lambda: not stats(d2).get("cached"))
+    cold, _ = dns_query(d2, 6.0)
+    check("NXDOMAIN 预取场景冷查询拿到 A", cold is not None and answers_of(cold) == ["10.0.0.20"],
+          detail=str(answers_of(cold) if cold else None))
+    base_attempts = stats(d2).get("upstream_attempts")
+    wait_until(PREFETCH_TTL + 3, "进入预取窗口",
+               lambda: stats(d2) if stats(d2).get("cached") and stats(d2).get("prefetch_due") else None)
+    del_record(d2)  # 预取时权威将回 NXDOMAIN
+    hit, hit_id = dns_query(d2, 6.0)
+    check("触发预取的命中请求仍立即拿到旧 A",
+          hit is not None and answers_of(hit) == ["10.0.0.20"] and int(hit.header.id) == hit_id,
+          detail=str(answers_of(hit) if hit else None))
+    neg = wait_until(5, "预取写入负缓存",
+                     lambda: stats(d2) if stats(d2).get("cache_kind") == "negative" else None)
+    check("预取得到 NXDOMAIN 后按负缓存规则替换缓存",
+          neg.get("rcode") == int(RCODE.NXDOMAIN) and neg.get("cached") is True, detail=str(neg))
+    check("预取的 NXDOMAIN 按 SOA minimum 计 TTL",
+          0 < neg.get("ttl_remaining", 0) <= NEG_TTL, detail=str(neg))
+    nx, nx_id = dns_query(d2, 3.0)
+    check("替换后的负缓存命中返回 NXDOMAIN 且 ID 正确",
+          nx is not None and nx.header.rcode == RCODE.NXDOMAIN and int(nx.header.id) == nx_id,
+          detail=str(nx.header if nx else None))
+    check("负缓存命中不增加回源次数", stats(d2).get("upstream_attempts") == base_attempts + 1,
+          detail=str(stats(d2)))
+    set_record(d2, "10.0.0.20", PREFETCH_TTL)
+
+    print("\n== 11. 预取失败：旧缓存照原期限、等待者 SERVFAIL、之后可重新回源 ==")
+    # 预取失败靠权威静默丢包（等待 UPSTREAM_TIMEOUT）模拟；为了让失败发生在
+    # 旧缓存仍有效、且预取窗口（TTL/4）内，TTL 取 4*(超时+2) 秒。
+    upstream_timeout = None
+    with urllib.request.urlopen(
+        f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
+        f"{os.environ.get('RESOLVER_STATS_PORT', '8081')}/stats", timeout=5
+    ) as resp:
+        upstream_timeout = float(json.loads(resp.read().decode())["upstream_timeout_s"])
+    PF_FAIL_TTL = int(4 * (upstream_timeout + 2))
+    print(f"   （upstream timeout={upstream_timeout}s -> 失败场景 TTL={PF_FAIL_TTL}s）")
+    set_delay(d2, 0)
+    set_delay(d1, 0)
+    set_drop(d1, False)
+    set_record(d1, "10.0.0.10", PF_FAIL_TTL)
+    wait_until(PF_FAIL_TTL + 5, "d1 旧缓存到期", lambda: not stats(d1).get("cached"))
+    cold, _ = dns_query(d1, 6.0)
+    check("失败场景冷查询拿到 A", cold is not None and answers_of(cold) == ["10.0.0.10"],
+          detail=str(answers_of(cold) if cold else None))
+    base_attempts = stats(d1).get("upstream_attempts")
+    base_prefetch = stats(d1).get("prefetch_attempts", 0)
+    base_failures = stats(d1).get("prefetch_failures", 0)
+    set_drop(d1, True)  # 预取将因权威静默丢包而超时失败
+
+    wait_until(PF_FAIL_TTL + 3, "进入预取窗口",
+               lambda: stats(d1) if stats(d1).get("cached") and stats(d1).get("prefetch_due") else None)
+    t_hit = time.time()
+    hit, hit_id = dns_query(d1, 6.0)
+    hit_elapsed = time.time() - t_hit
+    check("预取失败场景：触发查询仍立即拿到旧答复",
+          hit is not None and hit_elapsed < 0.5 and answers_of(hit) == ["10.0.0.10"],
+          detail=f"elapsed={hit_elapsed:.2f}s answers={answers_of(hit) if hit else None}")
+    check("预取失败场景：触发查询 ID 正确", hit is not None and int(hit.header.id) == hit_id)
+    check("预取回源计数增加", wait_until(3, "预取计数",
+          lambda: stats(d1) if stats(d1).get("prefetch_attempts", 0) == base_prefetch + 1 else None).get("prefetch_attempts") == base_prefetch + 1)
+    failed = wait_until(upstream_timeout + 6, "预取失败",
+                        lambda: stats(d1) if stats(d1).get("prefetch_failures", 0) > base_failures else None)
+    check("预取失败被单独计数", failed.get("prefetch_failures") == base_failures + 1, detail=str(failed))
+    check("预取失败后旧缓存仍有效（照原期限使用）",
+          failed.get("cached") is True and failed.get("ttl_remaining", 999) <= PF_FAIL_TTL,
+          detail=str(failed))
+    check("预取失败后缓存未被替换成 NXDOMAIN", failed.get("cache_kind") == "positive", detail=str(failed))
+    check("失败回源计入 upstream_failures 且记录错误", bool(failed.get("last_error")), detail=str(failed))
+
+    # 旧条目仍有剩余生命时，命中继续拿到旧答复，且不再触发新的预取
+    still, still_id = dns_query(d1, 3.0)
+    check("预取失败后旧缓存期内仍返回旧答复",
+          still is not None and answers_of(still) == ["10.0.0.10"] and int(still.header.id) == still_id,
+          detail=str(answers_of(still) if still else None))
+    check("同一份缓存失败后不再重复预取",
+          stats(d1).get("upstream_attempts") == base_attempts + 1
+          and stats(d1).get("prefetch_attempts") == base_prefetch + 1, detail=str(stats(d1)))
+
+    # 旧缓存到期（预取已失败）：新请求重新发起按需回源，权威仍丢包 -> SERVFAIL
+    wait_until(PF_FAIL_TTL + 5, "d1 旧缓存到期", lambda: not stats(d1).get("cached"))
+    failed_reply, failed_id = dns_query(d1, upstream_timeout + 3)
+    check("预取失败且旧缓存到期后，未命中请求重新回源并 SERVFAIL",
+          failed_reply is not None and failed_reply.header.rcode == RCODE.SERVFAIL
+          and int(failed_reply.header.id) == failed_id, detail=str(failed_reply.header if failed_reply else None))
+    check("重新回源计入回源次数", stats(d1).get("upstream_attempts") == base_attempts + 2,
+          detail=str(stats(d1)))
+    set_drop(d1, False)
+    recovered, recovered_id = dns_query(d1, 6.0)
+    check("权威恢复后未命中请求重新回源拿到 A",
+          recovered is not None and answers_of(recovered) == ["10.0.0.10"]
+          and int(recovered.header.id) == recovered_id, detail=str(answers_of(recovered) if recovered else None))
+    check("恢复后的回源再次计入次数", stats(d1).get("upstream_attempts") == base_attempts + 3,
+          detail=str(stats(d1)))
+    set_delay(d1, 0)
+    set_drop(d1, False)
+
+    print("\n== 12 预备：制造缓存供重启验证 ==")
     set_record(d1, "10.0.0.10", POS_TTL)
     dns_query(d1, 3.0)
     check("重启前缓存确实存在", bool(stats(d1).get("cached")), detail=str(stats(d1)))
